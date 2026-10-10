@@ -8,7 +8,7 @@ import pytest
 import requests
 
 from beets.util import bytestring_path
-from beetsplug.getlrc import GetLrcPlugin, Progress, Stats
+from beetsplug.getlrc.plugin import GetLrcPlugin, Progress, Stats
 
 
 class Item:
