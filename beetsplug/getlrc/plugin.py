@@ -32,7 +32,8 @@ class Stats:
     """Thread-safe fetch result counters."""
     def __init__(self):
         self._lock = threading.Lock()
-        self.created = 0
+        self.got = 0
+        self.found = 0
         self.plain = 0
         self.skipped = 0
         self.not_found = 0
@@ -44,11 +45,10 @@ class Stats:
     def add(self, field):
         with self._lock:
             setattr(self, field, getattr(self, field) + 1)
-
     @property
     def total(self):
         with self._lock:
-            return (self.created + self.plain + self.skipped + self.not_found +
+            return (self.got + self.found + self.plain + self.skipped + self.not_found +
                     self.no_synced + self.missing_meta + self.errors + self.cached)
 
     def print_summary(self, use_color=False):
@@ -56,7 +56,7 @@ class Stats:
         lines = [
             '',
             f"{c.BOLD}{'─'*50}{c.RESET}",
-            f"  {c.GREEN}{'Created (.lrc):':<20}{c.RESET} {self.created}",
+            f"  {c.GREEN}{'Created (.lrc):':<20}{c.RESET} {self.got + self.found}",
             f"  {c.GREEN}{'Plain lyrics:':<20}{c.RESET} {self.plain}",
             f"  {'Skipped (exists):':<20} {self.skipped}",
             f"  {'Cached skip:':<20} {self.cached}",
@@ -134,6 +134,7 @@ class GetLrcPlugin(BeetsPlugin):
             'stats': True,
             'fallback_to_plain': False,
             'fallback_to_plain_lrc': False,
+            'search_fallback': True,
             'workers': 4,
             'progress': True,
             'quiet_import': False,
@@ -258,6 +259,52 @@ class GetLrcPlugin(BeetsPlugin):
                 self._log.debug(f'Attempt {attempt} failed ({e}), retrying in {wait}s...')
                 time.sleep(wait)
 
+    def _pick_best_synced(self, records, artist, title, album, duration):
+        """Strict match: exact artist, title, and album, then closest duration.
+
+        Only used to pick among /api/search candidates when /api/get
+        returned a plain-only record for the same query.
+        """
+        MAX_DURATION_DIFF = 3  # seconds
+
+        def norm(s):
+            return (s or '').strip().casefold()
+
+        artist_n = norm(artist)
+        title_n = norm(title)
+        album_n = norm(album)
+
+        candidates = []
+        for rec in records:
+            synced = rec.get('syncedLyrics')
+            if not synced or synced in (None, 'null', 'None') or rec.get('instrumental'):
+                continue
+            if norm(rec.get('artistName')) != artist_n:
+                continue
+            if norm(rec.get('trackName')) != title_n:
+                continue
+            if norm(rec.get('albumName')) != album_n:
+                continue
+            rec_duration = rec.get('duration')
+            if not duration or not rec_duration:
+                continue
+            diff = abs(rec_duration - duration)
+            if diff > MAX_DURATION_DIFF:
+                continue
+            candidates.append((diff, rec))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda c: c[0])
+        return candidates[0][1]
+
+    def _search_synced(self, artist, title, album, duration, timeout, retries):
+        """/api/search fallback for when /api/get returns a plain-only record."""
+        params = {'artist_name': artist, 'track_name': title}
+        url = 'https://lrclib.net/api/search?' + urllib.parse.urlencode(params)
+        response = self._request_with_retry(url, timeout, retries)
+        response.raise_for_status()
+        return self._pick_best_synced(response.json(), artist, title, album, duration)
+
     def _should_skip_cached(self, item, force):
         if force or not self.config['cache_results'].get(bool):
             return False
@@ -272,7 +319,7 @@ class GetLrcPlugin(BeetsPlugin):
             checked_str = getattr(item, 'getlrc_checked', None)
         if not status or not checked_str:
             return False
-        if status in ('created', 'exists'):
+        if status in ("got", "found", "exists"):
             return False
         try:
             checked = datetime.fromisoformat(checked_str)
@@ -328,6 +375,7 @@ class GetLrcPlugin(BeetsPlugin):
         return os.path.splitext(item_path)[0] + bytestring_path(ext)
 
     def fetch_lrc(self, item, force=False, pretend=False, stats=None, progress=None, progress_count=None, quiet=False):
+        matched_via_search = False
         try:
             lrc_path = self._get_lrc_path(item, '.lrc')
             plain_path = self._get_lrc_path(item, '.txt')
@@ -420,16 +468,30 @@ class GetLrcPlugin(BeetsPlugin):
 
             synced = data.get('syncedLyrics')
             plain = data.get('plainLyrics')
+            # /api/get can return a plain-only record even when synced
+            # records exist for the same track; try /api/search.
+            if not synced and self.config['search_fallback'].get(bool):
+                try:
+                    alt = self._search_synced(artist, title, item.album, duration, timeout, retries)
+                except (requests.RequestException, ValueError):
+                    alt = None
+                if alt:
+                    self._log.debug(self._fmt('Synced found via search', item))
+                    synced = alt.get('syncedLyrics')
+                    if not plain:
+                        plain = alt.get('plainLyrics')
+                    matched_via_search = True
 
             # 1. Synced .lrc file (primary goal)
             if synced and synced not in (None, 'null', 'None'):
                 try:
                     with open(syspath(lrc_path), 'w', encoding='utf-8') as f:
                         f.write(synced)
-                    self._print('Created', item, _C.GREEN, progress=progress, progress_count=progress_count)
-                    self._update_cache(item, 'created')
+                    status = "got" if not matched_via_search else "found"
+                    self._print(status.capitalize(), item, _C.GREEN, progress=progress, progress_count=progress_count)
+                    self._update_cache(item, status)
                     if stats:
-                        stats.add('created')
+                        stats.add(status)
                     return True
                 except OSError as e:
                     self._log.error(self._fmt('Write failed', item, _C.RED) + f' ({e})')
